@@ -8,7 +8,6 @@ import requests
 import tempfile
 import subprocess
 import signal
-import threading
 from datetime import datetime, timezone, timedelta
 from xvfbwrapper import Xvfb
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -22,14 +21,8 @@ except ImportError:
 MAX_CAPTCHA = 3
 MAX_RENEW_RETRIES_PER_URL = 50
 LOCAL_PROXY = "http://127.0.0.1:8080"
-CAPTCHA_TOTAL_TIMEOUT = 300   # solve_recaptcha 最长 5 分钟
-AUDIO_RECOGNIZE_TIMEOUT = 30  # 单次音频识别最长 30 秒
-ATTEMPT_TIMEOUT = 120         # 单次续期尝试页面操作最长 2 分钟
 
 class CaptchaBlocked(Exception):
-    pass
-
-class AttemptTimeout(Exception):
     pass
 
 def log(msg, level="INFO"):
@@ -246,53 +239,26 @@ def download_audio(url, use_proxy):
         except: pass
     return None
 
-# ─── 修复点 1：音频识别加 30 秒超时 ───────────────────────────────────────────
 def recognize_audio(mp3_path):
-    result = [None]
-    error  = [None]
+    try:
+        wav_path = mp3_path.replace(".mp3", ".wav")
+        AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as src:
+            text = recognizer.recognize_google(recognizer.record(src))
+        try: os.remove(wav_path)
+        except: pass
+        return text
+    except: return None
 
-    def _recognize():
-        try:
-            wav_path = mp3_path.replace(".mp3", ".wav")
-            AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
-            recognizer = sr.Recognizer()
-            with sr.AudioFile(wav_path) as src:
-                audio_data = recognizer.record(src)
-            # recognize_google 本身不接受 timeout 参数，用线程隔离
-            result[0] = recognizer.recognize_google(audio_data)
-            try: os.remove(wav_path)
-            except: pass
-        except Exception as e:
-            error[0] = e
-
-    t = threading.Thread(target=_recognize, daemon=True)
-    t.start()
-    t.join(timeout=AUDIO_RECOGNIZE_TIMEOUT)
-
-    if t.is_alive():
-        log(f"音频识别超时（>{AUDIO_RECOGNIZE_TIMEOUT}s），跳过本次", "WARN")
-        return None
-    if error[0]:
-        log(f"音频识别失败: {error[0]}", "WARN")
-        return None
-    return result[0]
-
-# ─── 修复点 2：solve_recaptcha 加 5 分钟总超时 ────────────────────────────────
 def solve_recaptcha(page, use_proxy):
-    deadline = time.time() + CAPTCHA_TOTAL_TIMEOUT
-
-    # 等待 anchor frame 出现，最多 15 秒
     start = time.time()
     while time.time() - start < 15:
         if find_recaptcha_frame(page, "anchor"): break
         time.sleep(1)
-    else:
-        raise RuntimeError("reCAPTCHA 加载超时")
+    else: raise RuntimeError("reCAPTCHA 加载超时")
 
     for i in range(MAX_CAPTCHA):
-        if time.time() > deadline:
-            raise RuntimeError(f"reCAPTCHA 破解总超时（>{CAPTCHA_TOTAL_TIMEOUT}s）")
-
         if is_recaptcha_solved(page): return True
         if is_blocked(page): raise CaptchaBlocked("IP 被封锁")
 
@@ -300,9 +266,6 @@ def solve_recaptcha(page, use_proxy):
             click_recaptcha_checkbox(page)
             time.sleep(2)
             if is_recaptcha_solved(page): return True
-
-        if time.time() > deadline:
-            raise RuntimeError(f"reCAPTCHA 破解总超时（>{CAPTCHA_TOTAL_TIMEOUT}s）")
 
         if not switch_to_audio(page):
             click_recaptcha_checkbox(page)
@@ -312,12 +275,10 @@ def solve_recaptcha(page, use_proxy):
         if not (audio_url := get_audio_url(page)): continue
         if not (mp3 := download_audio(audio_url, use_proxy)): continue
         
-        text = recognize_audio(mp3)   # 现在有超时保护
+        text = recognize_audio(mp3)
         try: os.remove(mp3)
         except: pass
-        if not text:
-            log("音频识别无结果，跳过本轮")
-            continue
+        if not text: continue
 
         log(f"音频识别结果: [{text}]")
         bframe = find_recaptcha_frame(page, "bframe")
@@ -332,7 +293,6 @@ def solve_recaptcha(page, use_proxy):
         time.sleep(5)
         if is_recaptcha_solved(page): return True
         time.sleep(2)
-
     raise RuntimeError("验证码达到最大尝试次数")
 
 def process_account(account):
@@ -388,14 +348,8 @@ def process_account(account):
                     WebGLRenderingContext.prototype.getParameter = function(p) { return p === 37446 ? 'Intel(R) UHD Graphics 630' : 1; };
                 """)
 
-                # ─── 修复点 3：页面操作设 2 分钟超时 ─────────────────────────────
-                attempt_deadline = time.time() + ATTEMPT_TIMEOUT
-
                 page.get(url, retry=3)
                 time.sleep(random.uniform(5, 8))
-
-                if time.time() > attempt_deadline:
-                    raise AttemptTimeout("页面加载超时")
 
                 server_name = get_server_name(page)
                 old_expire = get_expire_time(page)
@@ -412,9 +366,6 @@ def process_account(account):
                 if renew_btn2 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=2): renew_btn2.click(by_js=True)
                 time.sleep(8)
 
-                if time.time() > attempt_deadline:
-                    raise AttemptTimeout("点击续期按钮后超时")
-
                 if find_recaptcha_frame(page, "anchor"):
                     log("启动 reCAPTCHA 破解...")
                     try:
@@ -426,12 +377,6 @@ def process_account(account):
                             stop_singbox(singbox_proc)
                             singbox_proc = None
                             fallback_to_warp = True
-                        restart_warp()
-                        continue
-                    except RuntimeError as e:
-                        # ─── 修复点 4：reCAPTCHA 超时后继续下一次尝试，而非崩溃 ───
-                        log(f"reCAPTCHA 破解失败: {e}，重试下一次", "WARN")
-                        failure_reason = str(e)
                         restart_warp()
                         continue
                 
@@ -446,15 +391,6 @@ def process_account(account):
                     failure_reason = "未找到最终 Renew 按钮"
                 
                 if success: break
-
-            except AttemptTimeout as e:
-                log(f"本次尝试超时: {e}，继续下一次", "WARN")
-                failure_reason = str(e)
-                if using_custom_proxy:
-                    stop_singbox(singbox_proc)
-                    singbox_proc = None
-                    fallback_to_warp = True
-                restart_warp()
 
             except Exception as e:
                 log(f"尝试异常: {e}", "ERROR")
